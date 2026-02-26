@@ -352,6 +352,30 @@ for c in [col_est, col_defl]:
 df.dropna(subset=[col_est, col_defl], inplace=True)
 df.reset_index(drop=True, inplace=True)
 
+# -- Filtro de Estacao na sidebar --
+with st.sidebar:
+    st.divider()
+    st.markdown("#### Filtro de Estacao")
+    est_min_data = float(df[col_est].min())
+    est_max_data = float(df[col_est].max())
+    est_range = st.slider(
+        "Intervalo de Estacao (m)",
+        min_value=est_min_data,
+        max_value=est_max_data,
+        value=(est_min_data, est_max_data),
+        step=10.0,
+        format="%.0f",
+        help="Selecione o trecho da rodovia a ser analisado."
+    )
+    est_filter_min, est_filter_max = est_range
+
+df = df[(df[col_est] >= est_filter_min) & (df[col_est] <= est_filter_max)].copy()
+df.reset_index(drop=True, inplace=True)
+
+if len(df) < 3:
+    st.error("Poucos registros apos o filtro de Estacao. Amplie o intervalo.")
+    st.stop()
+
 col_diff = 'Diferenca'
 col_zi   = 'Diferenca Acumulada (Zi)'
 media_deflexao = df[col_defl].mean()
@@ -755,3 +779,4 @@ st.markdown("""
     Segmentacao Homogenea Zi - Metodo CUSUM | Streamlit + Plotly
 </div>
 """, unsafe_allow_html=True)
+
