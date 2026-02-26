@@ -285,9 +285,6 @@ with st.sidebar:
         help="Segmentos maiores serao subdivididos."
     )
 
-    st.divider()
-    st.caption(f"Gerado em {datetime.now():%d/%m/%Y %H:%M}")
-
 # ======================================================================
 #  HERO HEADER
 # ======================================================================
@@ -779,4 +776,5 @@ st.markdown("""
     Segmentacao Homogenea Zi - Metodo CUSUM | Streamlit + Plotly
 </div>
 """, unsafe_allow_html=True)
+
 
