@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Segmentacao Homogenea de Rodovias - Metodo CUSUM (Zi)
+Segmentacao Homogenea de Rodovias — App Unificado
+Metodos: CDA (CUSUM/Zi), SHS (Spatial Heterogeneity) e MCV (Minimize CV)
 Dashboard interativo em Streamlit com Plotly.
 """
 
@@ -10,15 +11,19 @@ import numpy as np
 from scipy.signal import find_peaks
 import plotly.graph_objects as go
 import plotly.express as px
-from plotly.subplots import make_subplots
 from io import BytesIO
 from datetime import datetime
+
+from homogeneous_segmentation import (
+    segment_ids_to_maximize_spatial_heterogeneity,
+    segment_ids_to_minimize_coefficient_of_variation,
+)
 
 # ======================================================================
 #  CONFIGURACAO DA PAGINA
 # ======================================================================
 st.set_page_config(
-    page_title="Segmentacao Zi - CUSUM",
+    page_title="Segmentacao Unificada — CDA · SHS · MCV",
     page_icon="\U0001f6e3\ufe0f",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -47,6 +52,8 @@ st.markdown("""
                  box-shadow: 0 4px 15px rgba(155,89,182,0.3); }
     .kpi-orange{ background: linear-gradient(135deg, #f39c12 0%, #e67e22 100%);
                  box-shadow: 0 4px 15px rgba(243,156,18,0.3); }
+    .kpi-teal  { background: linear-gradient(135deg, #1abc9c 0%, #16a085 100%);
+                 box-shadow: 0 4px 15px rgba(26,188,156,0.3); }
     .story-box {
         background: #f8f9fa; border-left: 5px solid #667eea;
         padding: 15px 20px; border-radius: 0 10px 10px 0;
@@ -75,6 +82,7 @@ def story(text):
     st.markdown(f'<div class="story-box">{text}</div>', unsafe_allow_html=True)
 
 
+# ── CDA helper: fundir segmentos curtos ──
 def merge_short_segments(limites, df_local, col_est, min_m):
     limites = list(limites)
     while True:
@@ -99,6 +107,7 @@ def merge_short_segments(limites, df_local, col_est, min_m):
     return np.array(limites)
 
 
+# ── CDA helper: subdividir segmentos longos ──
 def split_long_segments(limites, df_local, col_est, max_m):
     new_limites = [limites[0]]
     for i in range(len(limites) - 1):
@@ -119,6 +128,30 @@ def split_long_segments(limites, df_local, col_est, max_m):
     return np.array(sorted(set(new_limites)))
 
 
+# ── SHS/MCV helper: tabela de segmentos a partir de IDs ──
+def build_segments_table(df, seg_ids_col, col_est, col_defl):
+    seg_groups = df.groupby(seg_ids_col)
+    segmentos = []
+    for seg_id, grp in seg_groups:
+        est_ini = grp[col_est].iloc[0]
+        est_fim = grp[col_est].iloc[-1]
+        comp = est_fim - est_ini
+        defl_media = grp[col_defl].mean()
+        defl_std = grp[col_defl].std(ddof=1) if len(grp) > 1 else 0.0
+        cv = (defl_std / defl_media * 100) if defl_media != 0 else 0.0
+        segmentos.append({
+            'SH': int(seg_id),
+            'Inicio (m)': est_ini,
+            'Fim (m)': est_fim,
+            'Comprimento (m)': comp,
+            'Defl. Media': round(defl_media, 1),
+            'Desvio Padrao': round(defl_std, 1),
+            'CV (%)': round(cv, 1),
+            'Defl. Caract.': round(defl_media + defl_std, 1),
+        })
+    return pd.DataFrame(segmentos)
+
+
 # Paleta hex para segmentos
 SEG_COLORS_HEX = [
     '#66c2a5', '#fc8d62', '#8da0cb', '#e78ac3', '#a6d854',
@@ -132,7 +165,19 @@ def rgba_from_hex(hex_color, alpha=0.3):
     return f'rgba({r},{g},{b},{alpha})'
 
 
-def gerar_excel(df_data, segmentos_df, picos_arr, vales_arr, limites, col_est, col_defl, col_d, col_z):
+COLOR_PRIMARY = '#667eea'
+COLOR_SEC     = '#764ba2'
+COLOR_RED     = '#e74c3c'
+COLOR_GREEN   = '#27ae60'
+COLOR_YELLOW  = '#f39c12'
+COLOR_TEAL    = '#1abc9c'
+
+
+# ── Excel unificado ──
+def gerar_excel_unificado(df_data, seg_cda_df, seg_shs_df, seg_mcv_df,
+                          col_est, col_defl,
+                          picos_arr=None, vales_arr=None, limites_idx_arr=None,
+                          col_zi_name=None):
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.chart import BarChart, Reference, LineChart
@@ -145,81 +190,131 @@ def gerar_excel(df_data, segmentos_df, picos_arr, vales_arr, limites, col_est, c
     COR_H = 'FF4A6FA5'; COR_H2 = 'FF667EEA'; COR_AC = 'FF764BA2'
     COR_LB = 'FFF2F4F8'; COR_W = 'FFFFFFFF'; COR_R = 'FFE74C3C'; COR_G = 'FF27AE60'
 
-    ft = Font(name='Calibri', bold=True, size=16, color='FFFFFF')
-    fh = Font(name='Calibri', bold=True, size=11, color='FFFFFF')
-    fb = Font(name='Calibri', size=11)
-    fH = PatternFill('solid', fgColor=COR_H)
+    ft  = Font(name='Calibri', bold=True, size=16, color='FFFFFF')
+    fh  = Font(name='Calibri', bold=True, size=11, color='FFFFFF')
+    fb  = Font(name='Calibri', size=11)
+    fH  = PatternFill('solid', fgColor=COR_H)
     fH2 = PatternFill('solid', fgColor=COR_H2)
-    fL = PatternFill('solid', fgColor=COR_LB)
-    fW = PatternFill('solid', fgColor=COR_W)
-    ac = Alignment(horizontal='center', vertical='center', wrap_text=True)
-    bd = Border(*[Side(style='thin', color='D0D0D0')]*4)
+    fAC = PatternFill('solid', fgColor=COR_AC)
+    fL  = PatternFill('solid', fgColor=COR_LB)
+    fW  = PatternFill('solid', fgColor=COR_W)
+    ac  = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    bd  = Border(*[Side(style='thin', color='D0D0D0')]*4)
 
     wb = Workbook()
 
-    # -- Resumo --
-    ws = wb.active; ws.title = 'Resumo'
-    ws.merge_cells('A1:F2')
-    ws['A1'].value = 'SEGMENTACAO HOMOGENEA - CUSUM (Zi)'; ws['A1'].font = ft; ws['A1'].fill = fH; ws['A1'].alignment = ac
-    cols_r = ['SH', 'Inicio (m)', 'Fim (m)', 'Comprimento (m)', 'Zi_fim', 'Defl. Media']
-    for j, cn in enumerate(cols_r, 1):
-        c = ws.cell(row=4, column=j, value=cn); c.font = fh; c.fill = fH2; c.alignment = ac; c.border = bd
-        ws.column_dimensions[get_column_letter(j)].width = 18
-    for i, rd in segmentos_df.iterrows():
-        for j, cn in enumerate(cols_r, 1):
-            c = ws.cell(row=5+i, column=j, value=rd[cn]); c.font = fb; c.alignment = ac; c.border = bd
-            c.fill = fL if i % 2 == 0 else fW
-            if cn in ['Inicio (m)', 'Fim (m)', 'Comprimento (m)']: c.number_format = '#,##0'
-            elif cn in ['Zi_fim', 'Defl. Media']: c.number_format = '0.0'
-    lr = 5 + len(segmentos_df) - 1
-    ws.conditional_formatting.add(f'D5:D{lr}', DataBarRule(start_type='min', end_type='max', color=COR_H2[2:]))
-    ch = BarChart(); ch.type='col'; ch.style=10; ch.title='Deflexao Media por SH'
-    ch.y_axis.title='Deflexao (0,01mm)'; ch.width=22; ch.height=12
-    ch.add_data(Reference(ws,min_col=6,min_row=4,max_row=lr), titles_from_data=True)
-    ch.set_categories(Reference(ws,min_col=1,min_row=5,max_row=lr))
-    ch.series[0].graphicalProperties.solidFill=COR_H2[2:]
-    ch.series[0].dLbls=DataLabelList(); ch.series[0].dLbls.showVal=True; ch.series[0].dLbls.numFmt='0.0'
-    ch.legend=None; ws.add_chart(ch, f'A{lr+3}')
+    def write_seg_sheet(ws, title, seg_df, fill_h):
+        ws.merge_cells('A1:H2')
+        ws['A1'].value = title; ws['A1'].font = ft; ws['A1'].fill = fH; ws['A1'].alignment = ac
+        cols = list(seg_df.columns)
+        for j, cn in enumerate(cols, 1):
+            c = ws.cell(row=4, column=j, value=cn)
+            c.font = fh; c.fill = fill_h; c.alignment = ac; c.border = bd
+            ws.column_dimensions[get_column_letter(j)].width = 18
+        for i, rd in seg_df.iterrows():
+            for j, cn in enumerate(cols, 1):
+                c = ws.cell(row=5+i, column=j, value=rd[cn])
+                c.font = fb; c.alignment = ac; c.border = bd
+                c.fill = fL if i % 2 == 0 else fW
+                if cn in ['Inicio (m)', 'Fim (m)', 'Comprimento (m)']: c.number_format = '#,##0'
+                elif cn in ['Defl. Media', 'Desvio Padrao', 'CV (%)', 'Defl. Caract.', 'Zi_fim']:
+                    c.number_format = '0.0'
+        lr = 5 + len(seg_df) - 1
+        if 'Comprimento (m)' in cols:
+            comp_col = cols.index('Comprimento (m)') + 1
+            ws.conditional_formatting.add(
+                f'{get_column_letter(comp_col)}5:{get_column_letter(comp_col)}{lr}',
+                DataBarRule(start_type='min', end_type='max', color=COR_H2[2:]))
+        if 'Defl. Media' in cols:
+            defl_col = cols.index('Defl. Media') + 1
+            ch = BarChart(); ch.type='col'; ch.style=10
+            ch.title='Deflexao Media por SH'; ch.y_axis.title='Deflexao (0,01mm)'
+            ch.width=22; ch.height=12
+            ch.add_data(Reference(ws, min_col=defl_col, min_row=4, max_row=lr), titles_from_data=True)
+            ch.set_categories(Reference(ws, min_col=1, min_row=5, max_row=lr))
+            ch.series[0].graphicalProperties.solidFill = COR_H2[2:]
+            ch.series[0].dLbls = DataLabelList()
+            ch.series[0].dLbls.showVal = True; ch.series[0].dLbls.numFmt = '0.0'
+            ch.legend = None
+            ws.add_chart(ch, f'A{lr+3}')
 
-    # -- Serie Zi --
-    ws2 = wb.create_sheet('Serie Zi')
-    hdrs = ['Estacao (m)', 'Zi', 'Zi (Picos)', 'Zi (Vales)']
-    for j, h in enumerate(hdrs, 1):
-        c = ws2.cell(row=1, column=j, value=h); c.font=fh; c.fill=fH2; c.alignment=ac; c.border=bd
-    p_set = set(picos_arr); v_set = set(vales_arr)
-    for i in range(len(df_data)):
-        ws2.cell(row=2+i, column=1, value=float(df_data.loc[i, col_est])).number_format='#,##0'
-        ws2.cell(row=2+i, column=2, value=float(df_data.loc[i, col_z])).number_format='0.00'
-        if i in p_set: ws2.cell(row=2+i, column=3, value=float(df_data.loc[i, col_z]))
-        if i in v_set: ws2.cell(row=2+i, column=4, value=float(df_data.loc[i, col_z]))
-    lz = 2+len(df_data)-1
-    cz = LineChart(); cz.title='Serie Zi - Picos e Vales'; cz.width=32; cz.height=16; cz.style=10
-    cz.y_axis.title='Zi'; cz.x_axis.title='Estacao (m)'
-    cz.add_data(Reference(ws2,min_col=2,min_row=1,max_row=lz), titles_from_data=True)
-    cz.add_data(Reference(ws2,min_col=3,min_row=1,max_row=lz), titles_from_data=True)
-    cz.add_data(Reference(ws2,min_col=4,min_row=1,max_row=lz), titles_from_data=True)
-    cz.set_categories(Reference(ws2,min_col=1,min_row=2,max_row=lz))
-    cz.series[0].graphicalProperties.line.solidFill=COR_H[2:]; cz.series[0].graphicalProperties.line.width=22000; cz.series[0].marker=Marker(symbol='none')
-    cz.series[1].graphicalProperties.line.noFill=True; cz.series[1].marker=Marker(symbol='triangle',size=10)
-    cz.series[1].marker.graphicalProperties=GraphicalProperties(); cz.series[1].marker.graphicalProperties.solidFill=COR_R[2:]
-    cz.series[2].graphicalProperties.line.noFill=True; cz.series[2].marker=Marker(symbol='triangle',size=10)
-    cz.series[2].marker.graphicalProperties=GraphicalProperties(); cz.series[2].marker.graphicalProperties.solidFill=COR_G[2:]
-    if len(df_data)>20: cz.x_axis.tickLblSkip=max(1,len(df_data)//15)
-    ws2.add_chart(cz, 'F1')
+    # ── Aba CDA ──
+    ws_cda = wb.active; ws_cda.title = 'Segmentos CDA'
+    if seg_cda_df is not None and len(seg_cda_df) > 0:
+        write_seg_sheet(ws_cda, 'SEGMENTACAO — CDA / CUSUM (Zi)', seg_cda_df, fH2)
+    else:
+        ws_cda['A1'].value = 'Metodo CDA nao executado'
 
-    # -- Dados Brutos --
-    ws3 = wb.create_sheet('Dados Brutos')
-    for j, cn in enumerate(df_data.columns, 1):
-        c = ws3.cell(row=1, column=j, value=cn); c.font=fh; c.fill=fH2; c.alignment=ac; c.border=bd
-        ws3.column_dimensions[get_column_letter(j)].width = 20
+    # ── Aba Serie Zi ──
+    ws_zi = wb.create_sheet('Serie Zi')
+    if (col_zi_name is not None and picos_arr is not None and vales_arr is not None
+            and col_zi_name in df_data.columns):
+        hdrs = ['Estacao (m)', 'Zi', 'Zi (Picos)', 'Zi (Vales)']
+        for j, h in enumerate(hdrs, 1):
+            c = ws_zi.cell(row=1, column=j, value=h)
+            c.font = fh; c.fill = fH2; c.alignment = ac; c.border = bd
+        p_set = set(picos_arr); v_set = set(vales_arr)
+        for i in range(len(df_data)):
+            ws_zi.cell(row=2+i, column=1, value=float(df_data.loc[i, col_est])).number_format = '#,##0'
+            ws_zi.cell(row=2+i, column=2, value=float(df_data.loc[i, col_zi_name])).number_format = '0.00'
+            if i in p_set:
+                ws_zi.cell(row=2+i, column=3, value=float(df_data.loc[i, col_zi_name]))
+            if i in v_set:
+                ws_zi.cell(row=2+i, column=4, value=float(df_data.loc[i, col_zi_name]))
+        lz = 2 + len(df_data) - 1
+        cz = LineChart(); cz.title = 'Serie Zi - Picos e Vales'
+        cz.width = 32; cz.height = 16; cz.style = 10
+        cz.y_axis.title = 'Zi'; cz.x_axis.title = 'Estacao (m)'
+        cz.add_data(Reference(ws_zi, min_col=2, min_row=1, max_row=lz), titles_from_data=True)
+        cz.add_data(Reference(ws_zi, min_col=3, min_row=1, max_row=lz), titles_from_data=True)
+        cz.add_data(Reference(ws_zi, min_col=4, min_row=1, max_row=lz), titles_from_data=True)
+        cz.set_categories(Reference(ws_zi, min_col=1, min_row=2, max_row=lz))
+        cz.series[0].graphicalProperties.line.solidFill = COR_H[2:]
+        cz.series[0].graphicalProperties.line.width = 22000
+        cz.series[0].marker = Marker(symbol='none')
+        cz.series[1].graphicalProperties.line.noFill = True
+        cz.series[1].marker = Marker(symbol='triangle', size=10)
+        cz.series[1].marker.graphicalProperties = GraphicalProperties()
+        cz.series[1].marker.graphicalProperties.solidFill = COR_R[2:]
+        cz.series[2].graphicalProperties.line.noFill = True
+        cz.series[2].marker = Marker(symbol='triangle', size=10)
+        cz.series[2].marker.graphicalProperties = GraphicalProperties()
+        cz.series[2].marker.graphicalProperties.solidFill = COR_G[2:]
+        if len(df_data) > 20:
+            cz.x_axis.tickLblSkip = max(1, len(df_data) // 15)
+        ws_zi.add_chart(cz, 'F1')
+    else:
+        ws_zi['A1'].value = 'Serie Zi nao disponivel (CDA nao executado)'
+
+    # ── Aba SHS ──
+    ws_shs = wb.create_sheet('Segmentos SHS')
+    if seg_shs_df is not None and len(seg_shs_df) > 0:
+        write_seg_sheet(ws_shs, 'SEGMENTACAO — Spatial Heterogeneity (SHS)', seg_shs_df, fAC)
+    else:
+        ws_shs['A1'].value = 'Metodo SHS nao executado'
+
+    # ── Aba MCV ──
+    ws_mcv = wb.create_sheet('Segmentos MCV')
+    if seg_mcv_df is not None and len(seg_mcv_df) > 0:
+        write_seg_sheet(ws_mcv, 'SEGMENTACAO — Minimize CV (MCV)', seg_mcv_df, fAC)
+    else:
+        ws_mcv['A1'].value = 'Metodo MCV nao executado'
+
+    # ── Aba Dados Brutos ──
+    ws_raw = wb.create_sheet('Dados Brutos')
+    cols_export = [c for c in df_data.columns if c not in ['slk_from', 'slk_to']]
+    for j, cn in enumerate(cols_export, 1):
+        c = ws_raw.cell(row=1, column=j, value=cn)
+        c.font = fh; c.fill = fH2; c.alignment = ac; c.border = bd
+        ws_raw.column_dimensions[get_column_letter(j)].width = 20
     for i, rd in df_data.iterrows():
-        for j, cn in enumerate(df_data.columns, 1):
+        for j, cn in enumerate(cols_export, 1):
             v = rd[cn]
-            ws3.cell(row=2+i, column=j, value=float(v) if isinstance(v,(int,float,np.integer,np.floating)) else v)
+            ws_raw.cell(row=2+i, column=j,
+                        value=float(v) if isinstance(v, (int, float, np.integer, np.floating)) else v)
 
     buf = BytesIO()
-    wb.save(buf)
-    buf.seek(0)
+    wb.save(buf); buf.seek(0)
     return buf.getvalue()
 
 
@@ -227,8 +322,8 @@ def gerar_excel(df_data, segmentos_df, picos_arr, vales_arr, limites, col_est, c
 #  SIDEBAR
 # ======================================================================
 with st.sidebar:
-    st.markdown("## \U0001f6e3\ufe0f Segmentacao Zi")
-    st.caption("Metodo CUSUM - Diferenca Acumulada")
+    st.markdown("## \U0001f6e3\ufe0f Segmentacao Unificada")
+    st.caption("CDA · SHS · MCV — 3 metodos em 1")
     st.divider()
 
     uploaded_file = st.file_uploader(
@@ -238,52 +333,51 @@ with st.sidebar:
     )
 
     st.divider()
-    st.markdown("### Parametros")
-
-    col_estacao_name  = st.text_input("Coluna **Estação**", value="Estação (m)")
-    col_deflexao_name = st.text_input("Coluna **Deflexão**", value="Deflexão (0,01mm)")
+    st.markdown("### Colunas")
+    col_estacao_name  = st.text_input("Coluna **Estacao**", value="Estação (m)")
+    col_deflexao_name = st.text_input("Coluna **Deflexao**", value="Deflexão (0,01mm)")
 
     st.divider()
-
-    st.markdown("#### `find_peaks` (scipy)")
-
-    fp_distance = st.slider(
-        "distance (pontos)",
-        min_value=1, max_value=50, value=5, step=1,
-        help="Distancia minima entre picos consecutivos (em pontos). Menor = mais candidatos."
-    )
-    fp_height = st.number_input(
-        "height (Zi)", value=0.0, step=1.0, format="%.1f",
-        help="Altura minima dos picos. 0 = desativado."
-    )
-    fp_prominence = st.number_input(
-        "prominence (Zi)", value=0.0, min_value=0.0, step=1.0, format="%.1f",
-        help="Proeminencia minima do pico em relacao aos vizinhos. 0 = desativado."
-    )
-    fp_width = st.number_input(
-        "width (pontos)", value=0.0, min_value=0.0, step=1.0, format="%.1f",
-        help="Largura minima do pico (em amostras). 0 = desativado."
-    )
-    fp_threshold = st.number_input(
-        "threshold (Zi)", value=0.0, min_value=0.0, step=0.5, format="%.1f",
-        help="Diferenca vertical minima entre o pico e seus vizinhos imediatos. 0 = desativado."
-    )
-    fp_plateau_size = st.number_input(
-        "plateau_size (pontos)", value=0, min_value=0, step=1,
-        help="Tamanho minimo do plato (flat top). 0 = desativado."
+    st.markdown("### Metodo(s) de Segmentacao")
+    metodos = st.multiselect(
+        "Selecione os metodos a aplicar",
+        options=["CDA (CUSUM/Zi)", "SHS (Spatial Heterogeneity)", "MCV (Minimize CV)"],
+        default=["CDA (CUSUM/Zi)", "SHS (Spatial Heterogeneity)", "MCV (Minimize CV)"],
+        help="Escolha um ou mais metodos."
     )
 
     st.divider()
     st.markdown("#### Restricoes de Comprimento")
-
     seg_min_m = st.number_input(
         "Comprimento MINIMO de SH (m)", value=800, min_value=50, step=50,
-        help="Segmentos menores serao fundidos com vizinhos."
-    )
+        help="Segmentos menores serao fundidos (CDA) ou restringidos (SHS/MCV).")
     seg_max_m = st.number_input(
         "Comprimento MAXIMO de SH (m)", value=5000, min_value=500, step=100,
-        help="Segmentos maiores serao subdivididos."
-    )
+        help="Segmentos maiores serao subdivididos (CDA) ou restringidos (SHS/MCV).")
+
+    # ── Parametros CDA ──
+    run_cda = "CDA (CUSUM/Zi)" in metodos
+    if run_cda:
+        st.divider()
+        st.markdown("#### Parametros CDA (`find_peaks`)")
+        fp_distance = st.slider("distance (pontos)", 1, 50, 5, 1,
+                                help="Distancia minima entre picos consecutivos.")
+        fp_height = st.number_input("height (Zi)", value=0.0, step=1.0, format="%.1f",
+                                    help="Altura minima dos picos. 0=desativado.")
+        fp_prominence = st.number_input("prominence (Zi)", value=0.0, min_value=0.0,
+                                        step=1.0, format="%.1f")
+        fp_width = st.number_input("width (pontos)", value=0.0, min_value=0.0,
+                                   step=1.0, format="%.1f")
+        fp_threshold = st.number_input("threshold (Zi)", value=0.0, min_value=0.0,
+                                       step=0.5, format="%.1f")
+        fp_plateau_size = st.number_input("plateau_size (pontos)", value=0, min_value=0, step=1)
+
+    run_shs = "SHS (Spatial Heterogeneity)" in metodos
+    run_mcv = "MCV (Minimize CV)" in metodos
+
+    st.divider()
+    st.caption(f"Gerado em {datetime.now():%d/%m/%Y %H:%M}")
+
 
 # ======================================================================
 #  HERO HEADER
@@ -296,11 +390,13 @@ st.markdown("""
         Segmentacao Homogenea de Rodovias
     </h1>
     <p style="color: rgba(255,255,255,0.85); font-size: 1.05rem; margin-top: 8px;">
-        Identificacao automatica de Segmentos Homogeneos via <b>CUSUM</b> -
-        Cumulative Sum Control Chart (Diferenca Acumulada Zi)
+        App unificado: <b>CDA</b> (Cumulative Difference Approach / CUSUM) ·
+        <b>SHS</b> (Spatial Heterogeneity Segmentation) ·
+        <b>MCV</b> (Minimize Coefficient of Variation)
     </p>
 </div>
 """, unsafe_allow_html=True)
+
 
 # ======================================================================
 #  PROCESSAMENTO
@@ -310,18 +406,22 @@ if uploaded_file is None:
     st.markdown("""
     ### O que este app faz?
     1. **Le** uma planilha com colunas **Estacao** e **Deflexao**
-    2. **Calcula** a Diferenca (Deflexao - Media) e a Diferenca Acumulada (Zi)
-    3. **Detecta** picos e vales na curva Zi via `scipy.signal.find_peaks`
-    4. **Aplica** restricoes de comprimento minimo e maximo nos segmentos
-    5. **Gera** visualizacoes interativas e exporta planilha Excel formatada
+    2. **Aplica** ate 3 metodos de segmentacao homogenea
+    3. **Gera** visualizacoes interativas (Plotly) e exporta planilha Excel formatada
 
     ---
-    **Colunas de entrada necessarias:**
-    | Coluna | Descricao |
+    **Metodos disponiveis:**
+
+    | Metodo | Descricao |
     |--------|-----------|
-    | Estacao (m) | Posicao quilometrica |
-    | Deflexao (0,01mm) | Valor medido |
+    | **CDA** | Diferenca acumulada (Zi / CUSUM) com deteccao de picos/vales via `scipy` |
+    | **SHS** | Maximiza a heterogeneidade espacial entre segmentos |
+    | **MCV** | Minimiza o coeficiente de variacao dentro de cada segmento |
     """)
+    st.stop()
+
+if not metodos:
+    st.warning("Selecione ao menos um metodo de segmentacao na barra lateral.")
     st.stop()
 
 # -- Leitura dos dados --
@@ -347,6 +447,7 @@ for c in [col_est, col_defl]:
         df[c] = df[c].astype(str).str.replace(',', '.').astype(float)
     df[c] = pd.to_numeric(df[c], errors='coerce')
 df.dropna(subset=[col_est, col_defl], inplace=True)
+df.sort_values(col_est, inplace=True)
 df.reset_index(drop=True, inplace=True)
 
 # -- Filtro de Estacao na sidebar --
@@ -357,11 +458,9 @@ with st.sidebar:
     est_max_data = float(df[col_est].max())
     est_range = st.slider(
         "Intervalo de Estacao (m)",
-        min_value=est_min_data,
-        max_value=est_max_data,
+        min_value=est_min_data, max_value=est_max_data,
         value=(est_min_data, est_max_data),
-        step=10.0,
-        format="%.0f",
+        step=10.0, format="%.0f",
         help="Selecione o trecho da rodovia a ser analisado."
     )
     est_filter_min, est_filter_max = est_range
@@ -373,312 +472,216 @@ if len(df) < 3:
     st.error("Poucos registros apos o filtro de Estacao. Amplie o intervalo.")
     st.stop()
 
-col_diff = 'Diferenca'
-col_zi   = 'Diferenca Acumulada (Zi)'
 media_deflexao = df[col_defl].mean()
-df[col_diff] = df[col_defl] - media_deflexao
-df[col_zi]   = df[col_diff].cumsum()
 
-zi = df[col_zi].values
-
-# -- Deteccao --
-# Montar dict de kwargs para find_peaks (somente parametros > 0)
-fp_kwargs = {'distance': max(1, fp_distance)}
-if fp_height > 0:
-    fp_kwargs['height'] = fp_height
-if fp_prominence > 0:
-    fp_kwargs['prominence'] = fp_prominence
-if fp_width > 0:
-    fp_kwargs['width'] = fp_width
-if fp_threshold > 0:
-    fp_kwargs['threshold'] = fp_threshold
-if fp_plateau_size > 0:
-    fp_kwargs['plateau_size'] = fp_plateau_size
-
-picos_raw, _ = find_peaks(zi, **fp_kwargs)
-vales_raw, _ = find_peaks(-zi, **fp_kwargs)
-limites_ini = np.sort(np.concatenate(([0], picos_raw, vales_raw, [len(df)-1])))
-
-limites_merged = merge_short_segments(limites_ini, df, col_est, seg_min_m)
-limites_idx    = split_long_segments(limites_merged, df, col_est, seg_max_m)
-
-picos = np.array(sorted(set(picos_raw) & set(limites_idx)))
-vales = np.array(sorted(set(vales_raw) & set(limites_idx)))
-
-# -- Tabela de segmentos --
-segmentos = []
-for i in range(len(limites_idx) - 1):
-    ii, fi = limites_idx[i], limites_idx[i+1]
-    est_i = float(df.loc[ii, col_est]); est_f = float(df.loc[fi, col_est])
-    defl_seg = df.loc[ii:fi, col_defl]
-    defl_media = defl_seg.mean()
-    defl_std   = defl_seg.std(ddof=1) if len(defl_seg) > 1 else 0.0
-    segmentos.append({
-        'SH': i+1,
-        'Inicio (m)': est_i,
-        'Fim (m)': est_f,
-        'Comprimento (m)': est_f - est_i,
-        'Zi_fim': round(float(df.loc[fi, col_zi]), 1),
-        'Defl. Media': round(defl_media, 1),
-        'Desvio Padrao': round(defl_std, 1),
-        'Defl. Caract.': round(defl_media + defl_std, 1),
-    })
-seg_df = pd.DataFrame(segmentos)
 
 # ======================================================================
-#  KPIs
+#  EXECUTAR METODOS
 # ======================================================================
-st.markdown("### Indicadores-Chave")
 
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-with c1: st.markdown(kpi_card(f"{len(seg_df)}", "Segmentos"), unsafe_allow_html=True)
-with c2: st.markdown(kpi_card(f"{seg_df['Comprimento (m)'].sum():,.0f} m", "Extensao Total", "kpi-green"), unsafe_allow_html=True)
-with c3: st.markdown(kpi_card(f"{seg_df['Comprimento (m)'].mean():,.0f} m", "Compr. Medio", "kpi-blue"), unsafe_allow_html=True)
-with c4: st.markdown(kpi_card(f"{len(picos)}", "Picos", "kpi-red"), unsafe_allow_html=True)
-with c5: st.markdown(kpi_card(f"{len(vales)}", "Vales", "kpi-green"), unsafe_allow_html=True)
-with c6: st.markdown(kpi_card(f"{media_deflexao:.1f}", "Defl. Media Global", "kpi-orange"), unsafe_allow_html=True)
+# ── CDA ──
+seg_cda_df = None
+picos = np.array([]); vales = np.array([])
+limites_idx = np.array([]); picos_raw = np.array([]); vales_raw = np.array([])
+col_diff = 'Diferenca'; col_zi = 'Diferenca Acumulada (Zi)'
+zi = np.array([])
+fp_kwargs = {}
 
-st.markdown("")
+if run_cda:
+    df[col_diff] = df[col_defl] - media_deflexao
+    df[col_zi]   = df[col_diff].cumsum()
+    zi = df[col_zi].values
 
-story(
-    f"Foram identificados <b>{len(seg_df)} segmentos homogeneos</b> ao longo de "
-    f"<b>{seg_df['Comprimento (m)'].sum():,.0f} m</b> de rodovia. "
-    f"A deflexao media global e <b>{media_deflexao:.2f}</b> (0,01mm). "
-    f"O metodo CUSUM detectou <b>{len(picos_raw)} picos</b> e <b>{len(vales_raw)} vales</b> brutos; "
-    f"apos fusao (min {seg_min_m}m) e subdivisao (max {seg_max_m}m), restaram "
-    f"<b>{len(limites_idx)} pontos de limite</b>."
-)
+    fp_kwargs = {'distance': max(1, fp_distance)}
+    if fp_height > 0:       fp_kwargs['height'] = fp_height
+    if fp_prominence > 0:   fp_kwargs['prominence'] = fp_prominence
+    if fp_width > 0:        fp_kwargs['width'] = fp_width
+    if fp_threshold > 0:    fp_kwargs['threshold'] = fp_threshold
+    if fp_plateau_size > 0: fp_kwargs['plateau_size'] = fp_plateau_size
 
-st.divider()
+    picos_raw, _ = find_peaks(zi, **fp_kwargs)
+    vales_raw, _ = find_peaks(-zi, **fp_kwargs)
+    limites_ini = np.sort(np.concatenate(([0], picos_raw, vales_raw, [len(df)-1])))
 
-COLOR_PRIMARY = '#667eea'
-COLOR_SEC     = '#764ba2'
-COLOR_RED     = '#e74c3c'
-COLOR_GREEN   = '#27ae60'
-COLOR_YELLOW  = '#f39c12'
+    limites_merged = merge_short_segments(limites_ini, df, col_est, seg_min_m)
+    limites_idx    = split_long_segments(limites_merged, df, col_est, seg_max_m)
+
+    picos = np.array(sorted(set(picos_raw) & set(limites_idx)))
+    vales = np.array(sorted(set(vales_raw) & set(limites_idx)))
+
+    segmentos = []
+    for i in range(len(limites_idx) - 1):
+        ii, fi = limites_idx[i], limites_idx[i+1]
+        est_i = float(df.loc[ii, col_est]); est_f = float(df.loc[fi, col_est])
+        defl_seg = df.loc[ii:fi, col_defl]
+        defl_media = defl_seg.mean()
+        defl_std   = defl_seg.std(ddof=1) if len(defl_seg) > 1 else 0.0
+        cv = (defl_std / defl_media * 100) if defl_media != 0 else 0.0
+        segmentos.append({
+            'SH': i+1,
+            'Inicio (m)': est_i,  'Fim (m)': est_f,
+            'Comprimento (m)': est_f - est_i,
+            'Zi_fim': round(float(df.loc[fi, col_zi]), 1),
+            'Defl. Media': round(defl_media, 1),
+            'Desvio Padrao': round(defl_std, 1),
+            'CV (%)': round(cv, 1),
+            'Defl. Caract.': round(defl_media + defl_std, 1),
+        })
+    seg_cda_df = pd.DataFrame(segmentos)
+
+
+# ── SHS / MCV ──
+seg_shs_df = None
+seg_mcv_df = None
+
+if run_shs or run_mcv:
+    step = df[col_est].diff().median()
+    df['slk_from'] = df[col_est]
+    df['slk_to'] = df[col_est].shift(-1).fillna(df[col_est].iloc[-1] + step)
+    seg_range = (float(seg_min_m), float(seg_max_m))
+
+if run_shs:
+    try:
+        df['seg_shs'] = segment_ids_to_maximize_spatial_heterogeneity(
+            data=df, measure=("slk_from", "slk_to"),
+            variable_column_names=[col_defl],
+            allowed_segment_length_range=seg_range,
+        )
+        seg_shs_df = build_segments_table(df, 'seg_shs', col_est, col_defl)
+    except Exception as e:
+        st.error(f"Erro no metodo SHS: {e}")
+
+if run_mcv:
+    try:
+        df['seg_mcv'] = segment_ids_to_minimize_coefficient_of_variation(
+            data=df, measure=("slk_from", "slk_to"),
+            variable_column_names=[col_defl],
+            allowed_segment_length_range=seg_range,
+        )
+        seg_mcv_df = build_segments_table(df, 'seg_mcv', col_est, col_defl)
+    except Exception as e:
+        st.error(f"Erro no metodo MCV: {e}")
+
+
+# Verificar que ao menos 1 metodo retornou resultado
+results = {'CDA': seg_cda_df, 'SHS': seg_shs_df, 'MCV': seg_mcv_df}
+active_results = {k: v for k, v in results.items() if v is not None and len(v) > 0}
+
+if not active_results:
+    st.error("Nenhum metodo retornou resultados. Verifique os parametros.")
+    st.stop()
+
 
 # ======================================================================
-#  ABAS PRINCIPAIS
+#  FUNCAO DE RENDERIZACAO GENERICA POR METODO
 # ======================================================================
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "Serie Zi", "Segmentos", "Analise", "Dados", "Exportar"
-])
 
-# -- TAB 1: Serie Zi --
-with tab1:
-    st.markdown("#### Deflexao ao Longo da Rodovia")
-    story("O grafico abaixo mostra os valores de deflexao medidos. "
-          "A <span style='color:#e74c3c;font-weight:bold;'>linha tracejada vermelha</span> "
-          "indica a media global - pontos acima representam trechos com deflexao superior.")
+def render_method_tab(method_key, seg_df, extra_info=""):
+    """Renderiza KPIs, graficos e tabela para um metodo qualquer."""
 
+    st.markdown(f"### Indicadores — {method_key}")
+
+    cols_kpi = st.columns(5)
+    with cols_kpi[0]:
+        st.markdown(kpi_card(f"{len(seg_df)}", "Segmentos"), unsafe_allow_html=True)
+    with cols_kpi[1]:
+        st.markdown(kpi_card(f"{seg_df['Comprimento (m)'].sum():,.0f} m",
+                             "Extensao Total", "kpi-green"), unsafe_allow_html=True)
+    with cols_kpi[2]:
+        st.markdown(kpi_card(f"{seg_df['Comprimento (m)'].mean():,.0f} m",
+                             "Compr. Medio", "kpi-blue"), unsafe_allow_html=True)
+    with cols_kpi[3]:
+        st.markdown(kpi_card(f"{seg_df['CV (%)'].mean():.1f}%",
+                             "CV Medio", "kpi-purple"), unsafe_allow_html=True)
+    with cols_kpi[4]:
+        st.markdown(kpi_card(f"{media_deflexao:.1f}",
+                             "Defl. Media Global", "kpi-orange"), unsafe_allow_html=True)
+
+    st.markdown("")
+    story(
+        f"O metodo <b>{method_key}</b> identificou <b>{len(seg_df)} segmentos homogeneos</b> "
+        f"ao longo de <b>{seg_df['Comprimento (m)'].sum():,.0f} m</b>. "
+        f"O CV medio dos segmentos e <b>{seg_df['CV (%)'].mean():.1f}%</b>. "
+        f"Restricoes: [{seg_min_m} m, {seg_max_m} m]. {extra_info}"
+    )
+    st.divider()
+
+    # -- Deflexao ao longo da rodovia --
+    st.markdown(f"#### Deflexao ao Longo da Rodovia — {method_key}")
     fig_defl = go.Figure()
-    fig_defl.add_trace(go.Bar(
-        x=df[col_est], y=df[col_defl], name='Deflexao',
-        marker_color=COLOR_PRIMARY, opacity=0.6,
-    ))
+    for i, row in seg_df.iterrows():
+        mask = (df[col_est] >= row['Inicio (m)']) & (df[col_est] <= row['Fim (m)'])
+        hex_c = SEG_COLORS_HEX[i % len(SEG_COLORS_HEX)]
+        fig_defl.add_trace(go.Bar(
+            x=df.loc[mask, col_est], y=df.loc[mask, col_defl],
+            marker_color=hex_c, opacity=0.7,
+            name=f"SH {row['SH']} ({row['Comprimento (m)']:,.0f}m)",
+            legendgroup=f"sh{row['SH']}",
+        ))
     fig_defl.add_hline(y=media_deflexao, line_dash='dash', line_color=COLOR_RED, line_width=2,
                        annotation_text=f'Media = {media_deflexao:.2f}',
                        annotation_position='top right')
     fig_defl.update_layout(
         xaxis_title='Estacao (m)', yaxis_title='Deflexao (0,01mm)',
-        template='plotly_white', height=380, margin=dict(t=30, b=40),
-        legend=dict(orientation='h', y=-0.15)
+        template='plotly_white', height=420, margin=dict(t=30, b=60),
+        legend=dict(orientation='h', y=-0.18, xanchor='center', x=0.5, font_size=10),
+        barmode='stack',
     )
-    st.plotly_chart(fig_defl)
+    st.plotly_chart(fig_defl, use_container_width=True)
 
-    st.markdown("#### Serie de Diferencas Acumuladas (Zi)")
-    story("A curva Zi e a <b>soma cumulativa</b> das diferencas (Deflexao - Media). "
-          "Os <span style='color:#e74c3c;font-weight:bold;'>picos</span> e "
-          "<span style='color:#27ae60;font-weight:bold;'>vales</span> marcam as mudancas de comportamento - "
-          "cada transicao pico/vale define um <b>Segmento Homogeneo</b>.")
-
-    fig_zi = go.Figure()
-
-    for i, row in seg_df.iterrows():
-        mask = (df[col_est] >= row['Inicio (m)']) & (df[col_est] <= row['Fim (m)'])
-        hex_c = SEG_COLORS_HEX[i % len(SEG_COLORS_HEX)]
-        fig_zi.add_trace(go.Scatter(
-            x=df.loc[mask, col_est], y=zi[mask],
-            fill='tozeroy', mode='lines', line=dict(width=0),
-            fillcolor=rgba_from_hex(hex_c, 0.2),
-            name=f"SH {row['SH']}",
-            showlegend=False, hoverinfo='skip'
-        ))
-
-    fig_zi.add_trace(go.Scatter(
-        x=df[col_est], y=zi, mode='lines', name='Zi',
-        line=dict(color='#2c3e50', width=2.5),
-    ))
-
-    if len(picos) > 0:
-        fig_zi.add_trace(go.Scatter(
-            x=df.loc[picos, col_est].values, y=zi[picos],
-            mode='markers+text', name=f'Picos ({len(picos)})',
-            marker=dict(symbol='triangle-up', size=14, color=COLOR_RED, line=dict(color='white', width=2)),
-            text=[f'{v:.0f}' for v in zi[picos]],
-            textposition='top center', textfont=dict(size=9, color=COLOR_RED),
-        ))
-
-    if len(vales) > 0:
-        fig_zi.add_trace(go.Scatter(
-            x=df.loc[vales, col_est].values, y=zi[vales],
-            mode='markers+text', name=f'Vales ({len(vales)})',
-            marker=dict(symbol='triangle-down', size=14, color=COLOR_GREEN, line=dict(color='white', width=2)),
-            text=[f'{v:.0f}' for v in zi[vales]],
-            textposition='bottom center', textfont=dict(size=9, color=COLOR_GREEN),
-        ))
-
-    for idx in limites_idx[1:-1]:
-        fig_zi.add_vline(x=float(df.loc[idx, col_est]), line_dash='dot',
-                         line_color='gray', line_width=0.8, opacity=0.5)
-
-    fig_zi.add_hline(y=0, line_dash='dash', line_color='gray', line_width=1, opacity=0.5)
-    fig_zi.update_layout(
-        xaxis_title='Estacao (m)', yaxis_title='Diferenca Acumulada (Zi)',
-        template='plotly_white', height=500, margin=dict(t=30, b=40),
-        legend=dict(orientation='h', y=-0.12),
-        hovermode='x unified',
-    )
-    st.plotly_chart(fig_zi)
-
-
-# -- TAB 2: Segmentos --
-with tab2:
-    st.markdown("#### Mapa de Segmentos Homogeneos")
-    story(
-        f"Os <b>{len(seg_df)} segmentos</b> estao representados com cores distintas. "
-        f"O segmento mais longo tem <b>{seg_df['Comprimento (m)'].max():,.0f} m</b> "
-        f"e o mais curto <b>{seg_df['Comprimento (m)'].min():,.0f} m</b>."
-    )
-
-    # --- Plot 1: Serie Zi com segmentos coloridos ---
-    st.markdown("##### Serie Zi - Segmentos Coloridos")
-    fig_zi_seg = go.Figure()
-    for i, row in seg_df.iterrows():
-        mask = (df[col_est] >= row['Inicio (m)']) & (df[col_est] <= row['Fim (m)'])
-        hex_c = SEG_COLORS_HEX[i % len(SEG_COLORS_HEX)]
-        fig_zi_seg.add_trace(go.Scatter(
-            x=df.loc[mask, col_est], y=zi[mask],
-            fill='tozeroy', mode='lines', line=dict(width=0.5, color=hex_c),
-            fillcolor=rgba_from_hex(hex_c, 0.45),
-            name=f"SH {row['SH']} ({row['Comprimento (m)']:,.0f}m)",
-            legendgroup=f"sh{row['SH']}", showlegend=True,
-        ))
-    fig_zi_seg.add_trace(go.Scatter(
-        x=df[col_est], y=zi, mode='lines', name='Zi',
-        line=dict(color='#2c3e50', width=2), showlegend=False,
-    ))
-    fig_zi_seg.update_layout(
-        template='plotly_white', height=450,
-        margin=dict(t=20, b=60),
-        xaxis_title='Estacao (m)', yaxis_title='Zi',
-        legend=dict(orientation='h', y=-0.18, font_size=10,
-                    xanchor='center', x=0.5),
-        hovermode='x unified',
-    )
-    st.plotly_chart(fig_zi_seg)
-
-    st.markdown("")  # espacamento entre os graficos
-
-    # --- Plot 2: Deflexao media por segmento ---
-    st.markdown("##### Deflexao Media por Segmento")
-    fig_bar_seg = go.Figure()
+    # -- Deflexao media por segmento --
+    st.markdown(f"#### Deflexao Media por Segmento — {method_key}")
+    fig_bar = go.Figure()
     bar_colors = [COLOR_RED if d > seg_df['Defl. Media'].mean() * 1.2
                   else COLOR_YELLOW if d > seg_df['Defl. Media'].mean()
-                  else COLOR_GREEN
-                  for d in seg_df['Defl. Media']]
-    fig_bar_seg.add_trace(go.Bar(
+                  else COLOR_GREEN for d in seg_df['Defl. Media']]
+    fig_bar.add_trace(go.Bar(
         x=seg_df['SH'].apply(lambda x: f'SH {x}'), y=seg_df['Defl. Media'],
-        marker_color=bar_colors, name='Defl. Media', showlegend=False,
-        text=seg_df['Defl. Media'].apply(lambda x: f'{x:.1f}'),
-        textposition='outside',
+        marker_color=bar_colors, showlegend=False,
+        text=seg_df['Defl. Media'].apply(lambda x: f'{x:.1f}'), textposition='outside',
     ))
-    fig_bar_seg.add_hline(y=seg_df['Defl. Media'].mean(),
-                          line_dash='dash', line_color=COLOR_PRIMARY, line_width=2,
-                          annotation_text=f"Media = {seg_df['Defl. Media'].mean():.1f}")
-    fig_bar_seg.update_layout(
-        template='plotly_white', height=380,
-        margin=dict(t=20, b=40),
-        xaxis_title='Segmento', yaxis_title='Defl. Media (0,01mm)',
-    )
-    st.plotly_chart(fig_bar_seg)
+    fig_bar.add_hline(y=seg_df['Defl. Media'].mean(), line_dash='dash',
+                      line_color=COLOR_PRIMARY, line_width=2,
+                      annotation_text=f"Media = {seg_df['Defl. Media'].mean():.1f}")
+    fig_bar.update_layout(template='plotly_white', height=380, margin=dict(t=20, b=40),
+                          xaxis_title='Segmento', yaxis_title='Defl. Media (0,01mm)')
+    st.plotly_chart(fig_bar, use_container_width=True)
 
+    # -- CV por segmento --
+    st.markdown(f"#### Coeficiente de Variacao por Segmento — {method_key}")
+    story("CV = Desvio Padrao / Media x 100. Valores <= 25% sao considerados homogeneos (Austroads AGPT05-19).")
+    fig_cv = go.Figure()
+    cv_colors = [COLOR_GREEN if cv <= 25 else COLOR_YELLOW if cv <= 40 else COLOR_RED
+                 for cv in seg_df['CV (%)']]
+    fig_cv.add_trace(go.Bar(
+        x=seg_df['SH'].apply(lambda x: f'SH {x}'), y=seg_df['CV (%)'],
+        marker_color=cv_colors, showlegend=False,
+        text=seg_df['CV (%)'].apply(lambda x: f'{x:.1f}%'), textposition='outside',
+    ))
+    fig_cv.add_hline(y=25, line_dash='dash', line_color=COLOR_GREEN, line_width=2,
+                     annotation_text="Limite Austroads (25%)")
+    fig_cv.update_layout(template='plotly_white', height=380, margin=dict(t=20, b=40),
+                         xaxis_title='Segmento', yaxis_title='CV (%)')
+    st.plotly_chart(fig_cv, use_container_width=True)
 
-# -- TAB 3: Analise --
-with tab3:
-    st.markdown("#### Analise Detalhada dos Segmentos")
-
-    col_a, col_b = st.columns(2)
-
-    with col_a:
-        st.markdown("##### Distribuicao de Comprimentos")
-        fig_hist = go.Figure()
-        fig_hist.add_trace(go.Histogram(
-            x=seg_df['Comprimento (m)'], nbinsx=max(5, len(seg_df)//2),
-            marker_color=COLOR_PRIMARY, opacity=0.75, name='Comprimento',
-        ))
-        fig_hist.add_vline(x=seg_df['Comprimento (m)'].mean(), line_dash='dash',
-                           line_color=COLOR_RED, annotation_text=f"Media = {seg_df['Comprimento (m)'].mean():,.0f}m")
-        fig_hist.add_vline(x=seg_min_m, line_dash='dot', line_color=COLOR_YELLOW,
-                           annotation_text=f"Min = {seg_min_m}m")
-        fig_hist.add_vline(x=seg_max_m, line_dash='dot', line_color=COLOR_YELLOW,
-                           annotation_text=f"Max = {seg_max_m}m")
-        fig_hist.update_layout(template='plotly_white', height=350,
-                               xaxis_title='Comprimento (m)', yaxis_title='Frequencia',
-                               margin=dict(t=30))
-        st.plotly_chart(fig_hist)
-
-    with col_b:
-        st.markdown("##### Comprimento por Segmento")
-        fig_bar = go.Figure()
-        bar_c = [COLOR_GREEN if seg_min_m <= x <= seg_max_m else COLOR_RED
-                 for x in seg_df['Comprimento (m)']]
-        fig_bar.add_trace(go.Bar(
-            x=seg_df['SH'], y=seg_df['Comprimento (m)'],
-            marker_color=bar_c, name='Comprimento',
-            text=seg_df['Comprimento (m)'].apply(lambda x: f'{x:,.0f}'),
-            textposition='outside',
-        ))
-        fig_bar.add_hline(y=seg_min_m, line_dash='dot', line_color=COLOR_YELLOW, line_width=2,
-                          annotation_text=f"Min = {seg_min_m}m")
-        fig_bar.add_hline(y=seg_max_m, line_dash='dot', line_color=COLOR_RED, line_width=2,
-                          annotation_text=f"Max = {seg_max_m}m")
-        fig_bar.update_layout(template='plotly_white', height=350,
-                              xaxis_title='Segmento (SH)', yaxis_title='Comprimento (m)',
-                              margin=dict(t=30))
-        st.plotly_chart(fig_bar)
-
-    # Boxplot
-    st.markdown("##### Variabilidade da Deflexao por Segmento")
-    story("O boxplot revela a <b>dispersao interna</b> de cada segmento. "
-          "Segmentos com alta variabilidade podem indicar heterogeneidade remanescente.")
-
+    # -- Boxplot --
+    st.markdown(f"#### Variabilidade da Deflexao por Segmento — {method_key}")
     box_data = []
     for _, row in seg_df.iterrows():
         mask = (df[col_est] >= row['Inicio (m)']) & (df[col_est] <= row['Fim (m)'])
         for v in df.loc[mask, col_defl].values:
             box_data.append({'Segmento': f"SH {int(row['SH'])}", 'Deflexao': v})
     df_box = pd.DataFrame(box_data)
-
     fig_box = px.box(df_box, x='Segmento', y='Deflexao', color='Segmento',
                      color_discrete_sequence=px.colors.qualitative.Set2)
     fig_box.add_hline(y=media_deflexao, line_dash='dash', line_color=COLOR_RED,
                       annotation_text=f'Media global = {media_deflexao:.1f}')
     fig_box.update_layout(template='plotly_white', height=400,
-                          yaxis_title='Deflexao (0,01mm)', showlegend=False,
-                          margin=dict(t=30))
-    st.plotly_chart(fig_box)
+                          yaxis_title='Deflexao (0,01mm)', showlegend=False, margin=dict(t=30))
+    st.plotly_chart(fig_box, use_container_width=True)
 
-    # Resumo numerico
-    st.markdown("##### Resumo Estatistico dos Segmentos")
-    desc = seg_df[['Comprimento (m)', 'Defl. Media', 'Zi_fim']].describe().round(2)
-    st.dataframe(desc)
-
-
-# -- TAB 4: Dados --
-with tab4:
-    st.markdown("#### Tabela de Segmentos Homogeneos")
-
+    # -- Tabela --
+    st.markdown(f"#### Tabela de Segmentos — {method_key}")
     n_curtos = (seg_df['Comprimento (m)'] < seg_min_m).sum()
     n_longos = (seg_df['Comprimento (m)'] > seg_max_m).sum()
     if n_curtos == 0 and n_longos == 0:
@@ -688,47 +691,268 @@ with tab4:
         if n_curtos: st.warning(f"{n_curtos} segmento(s) abaixo de {seg_min_m}m")
         if n_longos: st.warning(f"{n_longos} segmento(s) acima de {seg_max_m}m")
 
+    format_dict = {'Inicio (m)': '{:,.0f}', 'Fim (m)': '{:,.0f}',
+                   'Comprimento (m)': '{:,.0f}', 'CV (%)': '{:.1f}',
+                   'Defl. Media': '{:.1f}', 'Desvio Padrao': '{:.1f}',
+                   'Defl. Caract.': '{:.1f}'}
+    if 'Zi_fim' in seg_df.columns:
+        format_dict['Zi_fim'] = '{:.1f}'
+
     st.dataframe(
         seg_df.style
             .background_gradient(subset=['Comprimento (m)'], cmap='Blues')
             .background_gradient(subset=['Defl. Media'], cmap='RdYlGn_r')
+            .background_gradient(subset=['CV (%)'], cmap='YlOrRd')
             .background_gradient(subset=['Defl. Caract.'], cmap='OrRd')
-            .format({'Inicio (m)': '{:,.0f}', 'Fim (m)': '{:,.0f}',
-                     'Comprimento (m)': '{:,.0f}', 'Zi_fim': '{:.1f}',
-                     'Defl. Media': '{:.1f}', 'Desvio Padrao': '{:.1f}',
-                     'Defl. Caract.': '{:.1f}'}),
+            .format(format_dict),
         height=400
     )
 
-    st.divider()
+    st.markdown("##### Resumo Estatistico")
+    desc_cols = ['Comprimento (m)', 'Defl. Media', 'CV (%)']
+    if 'Zi_fim' in seg_df.columns:
+        desc_cols.append('Zi_fim')
+    st.dataframe(seg_df[desc_cols].describe().round(2))
+
+
+# ======================================================================
+#  ABAS PRINCIPAIS
+# ======================================================================
+tab_labels = []
+tab_keys   = []
+
+for key in ['CDA', 'SHS', 'MCV']:
+    if key in active_results:
+        tab_labels.append(key)
+        tab_keys.append(key)
+
+if run_cda and seg_cda_df is not None:
+    tab_labels.append("Serie Zi")
+    tab_keys.append("__zi__")
+
+if len(active_results) >= 2:
+    tab_labels.append("Comparacao")
+    tab_keys.append("__comp__")
+
+tab_labels += ["Dados", "Exportar"]
+tab_keys   += ["__dados__", "__export__"]
+
+all_tabs = st.tabs(tab_labels)
+tab_map = dict(zip(tab_keys, all_tabs))
+
+
+# -- TABS POR METODO --
+for key in ['CDA', 'SHS', 'MCV']:
+    if key not in tab_map:
+        continue
+    with tab_map[key]:
+        seg = active_results[key]
+        extra = ""
+        if key == 'CDA':
+            extra = (f"Picos brutos: {len(picos_raw)}, Vales brutos: {len(vales_raw)}, "
+                     f"Limites finais: {len(limites_idx)}.")
+        render_method_tab(key, seg, extra)
+
+
+# -- TAB SERIE ZI (CDA only) --
+if "__zi__" in tab_map and seg_cda_df is not None:
+    with tab_map["__zi__"]:
+        st.markdown("#### Deflexao ao Longo da Rodovia")
+        story("Grafico de barras da deflexao medida. "
+              "A linha tracejada vermelha indica a media global.")
+
+        fig_defl_zi = go.Figure()
+        fig_defl_zi.add_trace(go.Bar(
+            x=df[col_est], y=df[col_defl], name='Deflexao',
+            marker_color=COLOR_PRIMARY, opacity=0.6,
+        ))
+        fig_defl_zi.add_hline(y=media_deflexao, line_dash='dash', line_color=COLOR_RED, line_width=2,
+                              annotation_text=f'Media = {media_deflexao:.2f}',
+                              annotation_position='top right')
+        fig_defl_zi.update_layout(xaxis_title='Estacao (m)', yaxis_title='Deflexao (0,01mm)',
+                                  template='plotly_white', height=380, margin=dict(t=30, b=40),
+                                  legend=dict(orientation='h', y=-0.15))
+        st.plotly_chart(fig_defl_zi, use_container_width=True)
+
+        st.markdown("#### Serie de Diferencas Acumuladas (Zi)")
+        story("Curva Zi = soma cumulativa de (Deflexao - Media). "
+              "Picos e vales marcam mudancas de comportamento que definem limites de SH.")
+
+        fig_zi = go.Figure()
+        for i, row in seg_cda_df.iterrows():
+            mask = (df[col_est] >= row['Inicio (m)']) & (df[col_est] <= row['Fim (m)'])
+            hex_c = SEG_COLORS_HEX[i % len(SEG_COLORS_HEX)]
+            fig_zi.add_trace(go.Scatter(
+                x=df.loc[mask, col_est], y=zi[mask],
+                fill='tozeroy', mode='lines', line=dict(width=0),
+                fillcolor=rgba_from_hex(hex_c, 0.2),
+                name=f"SH {row['SH']}", showlegend=False, hoverinfo='skip'))
+        fig_zi.add_trace(go.Scatter(
+            x=df[col_est], y=zi, mode='lines', name='Zi',
+            line=dict(color='#2c3e50', width=2.5)))
+        if len(picos) > 0:
+            fig_zi.add_trace(go.Scatter(
+                x=df.loc[picos, col_est].values, y=zi[picos],
+                mode='markers+text', name=f'Picos ({len(picos)})',
+                marker=dict(symbol='triangle-up', size=14, color=COLOR_RED,
+                            line=dict(color='white', width=2)),
+                text=[f'{v:.0f}' for v in zi[picos]],
+                textposition='top center', textfont=dict(size=9, color=COLOR_RED)))
+        if len(vales) > 0:
+            fig_zi.add_trace(go.Scatter(
+                x=df.loc[vales, col_est].values, y=zi[vales],
+                mode='markers+text', name=f'Vales ({len(vales)})',
+                marker=dict(symbol='triangle-down', size=14, color=COLOR_GREEN,
+                            line=dict(color='white', width=2)),
+                text=[f'{v:.0f}' for v in zi[vales]],
+                textposition='bottom center', textfont=dict(size=9, color=COLOR_GREEN)))
+        for idx in limites_idx[1:-1]:
+            fig_zi.add_vline(x=float(df.loc[idx, col_est]), line_dash='dot',
+                             line_color='gray', line_width=0.8, opacity=0.5)
+        fig_zi.add_hline(y=0, line_dash='dash', line_color='gray', line_width=1, opacity=0.5)
+        fig_zi.update_layout(
+            xaxis_title='Estacao (m)', yaxis_title='Diferenca Acumulada (Zi)',
+            template='plotly_white', height=500, margin=dict(t=30, b=40),
+            legend=dict(orientation='h', y=-0.12), hovermode='x unified')
+        st.plotly_chart(fig_zi, use_container_width=True)
+
+        # Mapa de segmentos coloridos
+        st.markdown("#### Mapa de Segmentos — Serie Zi Colorida")
+        fig_zi_seg = go.Figure()
+        for i, row in seg_cda_df.iterrows():
+            mask = (df[col_est] >= row['Inicio (m)']) & (df[col_est] <= row['Fim (m)'])
+            hex_c = SEG_COLORS_HEX[i % len(SEG_COLORS_HEX)]
+            fig_zi_seg.add_trace(go.Scatter(
+                x=df.loc[mask, col_est], y=zi[mask],
+                fill='tozeroy', mode='lines', line=dict(width=0.5, color=hex_c),
+                fillcolor=rgba_from_hex(hex_c, 0.45),
+                name=f"SH {row['SH']} ({row['Comprimento (m)']:,.0f}m)",
+                legendgroup=f"sh{row['SH']}", showlegend=True,
+            ))
+        fig_zi_seg.add_trace(go.Scatter(
+            x=df[col_est], y=zi, mode='lines', name='Zi',
+            line=dict(color='#2c3e50', width=2), showlegend=False,
+        ))
+        fig_zi_seg.update_layout(
+            template='plotly_white', height=450, margin=dict(t=20, b=60),
+            xaxis_title='Estacao (m)', yaxis_title='Zi',
+            legend=dict(orientation='h', y=-0.18, font_size=10, xanchor='center', x=0.5),
+            hovermode='x unified',
+        )
+        st.plotly_chart(fig_zi_seg, use_container_width=True)
+
+
+# -- TAB COMPARACAO --
+if "__comp__" in tab_map:
+    with tab_map["__comp__"]:
+        st.markdown("#### Comparacao entre Metodos")
+        story("Comparacao lado a lado dos metodos de segmentacao ativados.")
+
+        # KPIs lado a lado
+        comp_cols = st.columns(len(active_results))
+        method_colors = {'CDA': 'kpi-blue', 'SHS': 'kpi-purple', 'MCV': 'kpi-teal'}
+        for col_ui, (mkey, mdf) in zip(comp_cols, active_results.items()):
+            with col_ui:
+                st.markdown(f"##### {mkey}")
+                st.markdown(kpi_card(f"{len(mdf)}", f"Segmentos {mkey}",
+                                     method_colors.get(mkey, '')), unsafe_allow_html=True)
+                st.markdown(kpi_card(f"{mdf['CV (%)'].mean():.1f}%", "CV Medio", "kpi-orange"),
+                            unsafe_allow_html=True)
+                st.dataframe(
+                    mdf[['SH','Inicio (m)','Fim (m)','Comprimento (m)',
+                         'Defl. Media','CV (%)']].style.format(
+                        {'Inicio (m)': '{:,.0f}', 'Fim (m)': '{:,.0f}',
+                         'Comprimento (m)': '{:,.0f}', 'CV (%)': '{:.1f}',
+                         'Defl. Media': '{:.1f}'}), height=350)
+
+        st.divider()
+
+        # Grafico comparativo: deflexao media
+        st.markdown("##### Deflexao Media — Comparacao")
+        fig_comp = go.Figure()
+        method_plotcolors = {'CDA': COLOR_PRIMARY, 'SHS': COLOR_SEC, 'MCV': COLOR_TEAL}
+        for mkey, mdf in active_results.items():
+            fig_comp.add_trace(go.Bar(
+                x=mdf['SH'].apply(lambda x: f'SH {x}'),
+                y=mdf['Defl. Media'], name=mkey,
+                marker_color=method_plotcolors.get(mkey, COLOR_PRIMARY), opacity=0.8,
+                text=mdf['Defl. Media'].apply(lambda x: f'{x:.1f}'), textposition='outside',
+            ))
+        fig_comp.update_layout(barmode='group', template='plotly_white', height=400,
+                               xaxis_title='Segmento', yaxis_title='Defl. Media (0,01mm)',
+                               legend=dict(orientation='h', y=-0.15))
+        st.plotly_chart(fig_comp, use_container_width=True)
+
+        # Grafico comparativo: CV
+        st.markdown("##### CV (%) — Comparacao")
+        fig_cv_comp = go.Figure()
+        for mkey, mdf in active_results.items():
+            fig_cv_comp.add_trace(go.Bar(
+                x=mdf['SH'].apply(lambda x: f'SH {x}'),
+                y=mdf['CV (%)'], name=mkey,
+                marker_color=method_plotcolors.get(mkey, COLOR_PRIMARY), opacity=0.8,
+            ))
+        fig_cv_comp.add_hline(y=25, line_dash='dash', line_color=COLOR_GREEN,
+                              annotation_text="Limite Austroads (25%)")
+        fig_cv_comp.update_layout(barmode='group', template='plotly_white', height=400,
+                                  xaxis_title='Segmento', yaxis_title='CV (%)',
+                                  legend=dict(orientation='h', y=-0.15))
+        st.plotly_chart(fig_cv_comp, use_container_width=True)
+
+        # Resumo numerico
+        st.markdown("##### Resumo Numerico Comparativo")
+        resumo_data = []
+        for mkey, mdf in active_results.items():
+            resumo_data.append({
+                'Metodo': mkey,
+                'Segmentos': len(mdf),
+                'Extensao Total (m)': f"{mdf['Comprimento (m)'].sum():,.0f}",
+                'Compr. Medio (m)': f"{mdf['Comprimento (m)'].mean():,.0f}",
+                'CV Medio (%)': f"{mdf['CV (%)'].mean():.1f}",
+                'Defl. Media': f"{mdf['Defl. Media'].mean():.1f}",
+                'Homogeneos (CV<=25%)': f"{(mdf['CV (%)'] <= 25).sum()}/{len(mdf)}",
+            })
+        st.dataframe(pd.DataFrame(resumo_data), hide_index=True)
+
+
+# -- TAB DADOS --
+with tab_map["__dados__"]:
     st.markdown("#### Dados Brutos Processados")
-    st.caption(f"{len(df)} registros - Colunas calculadas: Diferenca, Zi")
-    st.dataframe(df, height=400)
+    cols_show = [c for c in df.columns if c not in ['slk_from', 'slk_to']]
+    st.caption(f"{len(df)} registros")
+    st.dataframe(df[cols_show], height=450)
 
 
-# -- TAB 5: Exportar --
-with tab5:
+# -- TAB EXPORTAR --
+with tab_map["__export__"]:
     st.markdown("#### Exportar Resultados")
-    story("Baixe os resultados em <b>Excel</b> (com graficos e formatacao) ou <b>CSV</b> (tabela simples).")
+    story("Baixe os resultados em <b>Excel</b> (com graficos e formatacao) ou <b>CSV</b>.")
 
     col_e1, col_e2 = st.columns(2)
+
     with col_e1:
-        st.markdown("""
+        abas_desc = ", ".join([f"Seg. {k}" for k in active_results.keys()])
+        if run_cda and seg_cda_df is not None:
+            abas_desc += ", Serie Zi"
+        st.markdown(f"""
         <div style="background:#f0f2f6; padding:20px; border-radius:12px; text-align:center;">
             <div style="font-size:3rem;">&#128215;</div>
             <div style="font-weight:bold; margin:8px 0;">Planilha Excel</div>
             <div style="font-size:0.85rem; color:#666;">
-                3 abas: Resumo, Serie Zi, Dados Brutos<br>
-                Graficos com picos/vales marcados
+                Abas: {abas_desc}, Dados Brutos
             </div>
         </div>
         """, unsafe_allow_html=True)
-        excel_bytes = gerar_excel(df, seg_df, picos, vales, limites_idx,
-                                  col_est, col_defl, col_diff, col_zi)
+        excel_bytes = gerar_excel_unificado(
+            df, seg_cda_df, seg_shs_df, seg_mcv_df,
+            col_est, col_defl,
+            picos_arr=picos, vales_arr=vales,
+            limites_idx_arr=limites_idx,
+            col_zi_name=col_zi if run_cda else None)
         st.download_button(
             "Baixar Excel",
             data=excel_bytes,
-            file_name=f"segmentos_Zi_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+            file_name=f"segmentos_unificado_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
@@ -738,34 +962,43 @@ with tab5:
             <div style="font-size:3rem;">&#128196;</div>
             <div style="font-weight:bold; margin:8px 0;">CSV (Segmentos)</div>
             <div style="font-size:0.85rem; color:#666;">
-                Tabela de segmentos homogeneos<br>
+                Todas as tabelas de segmentos<br>
                 Separador: ponto e virgula (;)
             </div>
         </div>
         """, unsafe_allow_html=True)
-        csv_data = seg_df.to_csv(index=False, sep=';').encode('utf-8-sig')
+        csv_parts = []
+        for mkey, mdf in active_results.items():
+            csv_parts.append(f"# METODO: {mkey}\n" + mdf.to_csv(index=False, sep=';'))
+        csv_data = "\n\n".join(csv_parts).encode('utf-8-sig')
         st.download_button(
             "Baixar CSV",
             data=csv_data,
-            file_name=f"segmentos_Zi_{datetime.now():%Y%m%d_%H%M%S}.csv",
+            file_name=f"segmentos_unificado_{datetime.now():%Y%m%d_%H%M%S}.csv",
             mime="text/csv",
         )
 
     st.divider()
     st.markdown("#### Parametros Utilizados")
-    fp_desc = [f'distance={fp_kwargs["distance"]}']
-    for k in ['height','prominence','width','threshold','plateau_size']:
-        if k in fp_kwargs:
-            fp_desc.append(f'{k}={fp_kwargs[k]}')
-    fp_str = ', '.join(fp_desc)
+    params_rows = [
+        {'Parametro': 'Metodo(s)', 'Valor': ', '.join(active_results.keys())},
+        {'Parametro': 'seg_min_m', 'Valor': f'{seg_min_m} m'},
+        {'Parametro': 'seg_max_m', 'Valor': f'{seg_max_m} m'},
+        {'Parametro': 'Media deflexao', 'Valor': f'{media_deflexao:.2f}'},
+        {'Parametro': 'Registros', 'Valor': str(len(df))},
+    ]
+    if run_cda:
+        fp_desc = ', '.join(f'{k}={v}' for k, v in fp_kwargs.items())
+        params_rows.append({'Parametro': 'find_peaks kwargs', 'Valor': fp_desc})
+        params_rows.append({'Parametro': 'Picos (brutos)', 'Valor': str(len(picos_raw))})
+        params_rows.append({'Parametro': 'Vales (brutos)', 'Valor': str(len(vales_raw))})
+        params_rows.append({'Parametro': 'Limites finais CDA', 'Valor': str(len(limites_idx))})
+    for mkey in ['CDA', 'SHS', 'MCV']:
+        if mkey in active_results:
+            params_rows.append({'Parametro': f'Segmentos {mkey}',
+                                'Valor': str(len(active_results[mkey]))})
+    st.dataframe(pd.DataFrame(params_rows), hide_index=True)
 
-    params_df = pd.DataFrame({
-        'Parametro': ['find_peaks kwargs', 'seg_min_m', 'seg_max_m', 'Media deflexao',
-                      'Picos (brutos)', 'Vales (brutos)', 'Limites finais', 'Segmentos'],
-        'Valor': [fp_str, f'{seg_min_m} m', f'{seg_max_m} m', f'{media_deflexao:.2f}',
-                  len(picos_raw), len(vales_raw), len(limites_idx), len(seg_df)]
-    })
-    st.dataframe(params_df, hide_index=True)
 
 # ======================================================================
 #  FOOTER
@@ -773,8 +1006,7 @@ with tab5:
 st.divider()
 st.markdown("""
 <div style="text-align: center; color: #999; font-size: 0.8rem; padding: 10px;">
-    Segmentacao Homogenea Zi - Metodo CUSUM | Streamlit + Plotly
+    Segmentacao Homogenea Unificada — CDA · SHS · MCV | Streamlit + Plotly
 </div>
 """, unsafe_allow_html=True)
-
 
